@@ -2,37 +2,36 @@ const fs = require('fs');
 const path = require('path');
 const { google } = require('googleapis');
 
-// 👉 Asegurate de tener el archivo `credentials.json` en el mismo directorio
-const CREDENTIALS_PATH = path.join(__dirname, 'credentials.json');
-const TOKEN_PATH = path.join(__dirname, 'token.json');
-
-// 👉 ID de la carpeta compartida en Drive donde guardarás session.zip
-const FOLDER_ID = '1ejHiPFpVrxXFNr8RRKEsZaQUWPf7cOl3';
+// 👉 ID de la carpeta compartida de Drive
+const FOLDER_ID = process.env.GDRIVE_FOLDER_ID;
+const filePath = path.join(__dirname, 'session.zip');
+const fileName = 'session.zip';
 
 const auth = new google.auth.GoogleAuth({
-  keyFile: CREDENTIALS_PATH,
+  credentials: {
+    type: "service_account",
+    project_id: process.env.GDRIVE_PROJECT_ID,
+    private_key_id: process.env.GDRIVE_PRIVATE_KEY_ID,
+    private_key: process.env.GDRIVE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+    client_email: process.env.GDRIVE_CLIENT_EMAIL,
+    client_id: process.env.GDRIVE_CLIENT_ID,
+  },
   scopes: ['https://www.googleapis.com/auth/drive'],
 });
 
 const drive = google.drive({ version: 'v3', auth });
 
 async function uploadSessionFile() {
-  const filePath = path.join(__dirname, 'session.zip');
-  const fileName = 'session.zip';
-
   try {
-    // 🔄 Verifica si ya existe
     const existing = await drive.files.list({
       q: `'${FOLDER_ID}' in parents and name='${fileName}' and trashed = false`,
-      fields: 'files(id, name)',
+      fields: 'files(id)',
     });
 
-    // 🗑️ Borra si ya existe
     for (const file of existing.data.files) {
       await drive.files.delete({ fileId: file.id });
     }
 
-    // ⬆️ Sube la nueva sesión
     const res = await drive.files.create({
       requestBody: {
         name: fileName,
@@ -52,13 +51,10 @@ async function uploadSessionFile() {
 }
 
 async function downloadSessionFile() {
-  const filePath = path.join(__dirname, 'session.zip');
-
   try {
-    // 🔍 Busca session.zip en la carpeta
     const res = await drive.files.list({
-      q: `'${FOLDER_ID}' in parents and name='session.zip' and trashed = false`,
-      fields: 'files(id, name)',
+      q: `'${FOLDER_ID}' in parents and name='${fileName}' and trashed = false`,
+      fields: 'files(id)',
     });
 
     if (res.data.files.length === 0) {
