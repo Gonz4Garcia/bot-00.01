@@ -1,106 +1,74 @@
 const fs = require('fs');
-const path = require('path');
-const { google } = require('googleapis');
-const AdmZip = require('adm-zip');
 const archiver = require('archiver');
+const { google } = require('googleapis');
+const path = require('path');
+
+const SESSION_DIR = path.join(__dirname, '.wwebjs_auth');
+const ZIP_PATH = path.join(__dirname, 'session.zip');
+const FILE_NAME = 'session.zip';
+const FOLDER_ID = '1ejHiPFpVrxXFNr8RRKEsZaQUWPf7cOl3';
 
 const auth = new google.auth.GoogleAuth({
-  keyFile: 'credentials.json',
-  scopes: ['https://www.googleapis.com/auth/drive'],
+  credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS),
+  scopes: ['https://www.googleapis.com/auth/drive']
 });
-
 const drive = google.drive({ version: 'v3', auth });
-const fileName = 'session.zip';
-const filePath = path.join(__dirname, fileName);
 
-async function findFile(folderId, name) {
-  const res = await drive.files.list({
-    q: `'${folderId}' in parents and name='${name}' and trashed=false`,
-    fields: 'files(id, name)',
-  });
-  return res.data.files[0];
-}
-
-async function downloadSessionFile() {
-  const folderId = process.env.FOLDER_ID;
-  const file = await findFile(folderId, fileName);
-  if (!file) {
-    console.log('📂 No se encontró session.zip en Drive.');
-    return false;
-  }
-
-  const dest = fs.createWriteStream(filePath);
-  const res = await drive.files.get({ fileId: file.id, alt: 'media' }, { responseType: 'stream' });
-
-  await new Promise((resolve, reject) => {
-    res.data.pipe(dest);
-    res.data.on('end', resolve);
-    res.data.on('error', reject);
-  });
-
-  console.log('✅ session.zip descargado desde Google Drive.');
-  return true;
-}
-
-async function uploadSessionFile() {
-  const folderId = process.env.FOLDER_ID;
-  const file = await findFile(folderId, fileName);
-
-  const fileMetadata = {
-    name: fileName,
-    parents: [folderId],
-  };
-
-  const media = {
-    mimeType: 'application/zip',
-    body: fs.createReadStream(filePath),
-  };
-
-  if (file) {
-    await drive.files.update({
-      fileId: file.id,
-      media,
-    });
-    console.log('☁️ session.zip actualizado en Google Drive.');
-  } else {
-    await drive.files.create({
-      resource: fileMetadata,
-      media,
-      fields: 'id',
-    });
-    console.log('☁️ session.zip subido a Google Drive.');
-  }
-}
-
-// 👉 Descomprimir sesión
-function unzipSession() {
-  if (!fs.existsSync(filePath)) return;
-  const zip = new AdmZip(filePath);
-  zip.extractAllTo('./auth_data', true);
-  console.log('📂 Sesión descomprimida en ./auth_data');
-}
-
-// 👉 Comprimir sesión
-function zipSession() {
+async function zipSession() {
   return new Promise((resolve, reject) => {
-    const output = fs.createWriteStream(filePath);
-    const archive = archiver('zip', { zlib: { level: 9 } });
-
-    output.on('close', () => {
-      console.log(`📦 session.zip creado (${archive.pointer()} bytes).`);
-      resolve();
-    });
-
-    archive.on('error', reject);
+    const output = fs.createWriteStream(ZIP_PATH);
+    const archive = archiver('zip');
+    output.on('close', () => resolve(ZIP_PATH));
+    archive.on('error', err => reject(err));
     archive.pipe(output);
-    archive.directory('./auth_data/Default', false);
+    archive.directory(SESSION_DIR, false);
     archive.finalize();
   });
 }
 
-module.exports = {
-  downloadSessionFile,
-  uploadSessionFile,
-  unzipSession,
-  zipSession,
-};
+async function uploadSessionToDrive() {
+  await zipSession();
+
+  const existing = await drive.files.list({
+    q: `'${FOLDER_ID}' in parents and name='${FILE_NAME}'`,
+    fields: 'files(id)',
+  });
+
+  if (existing.data.files.length) {
+    await drive.files.update({
+      fileId: existing.data.files[0].id,
+      media: { body: fs.createReadStream(ZIP_PATH) }
+    });
+  } else {
+    await drive.files.create({
+      resource: { name: FILE_NAME, parents: [FOLDER_ID] },
+      media: { body: fs.createReadStream(ZIP_PATH) },
+      fields: 'id',
+    });
+  }
+}
+
+async function downloadSessionFromDrive() {
+  const result = await drive.files.list({
+    q: `'${FOLDER_ID}' in parents and name='${FILE_NAME}'`,
+    fields: 'files(id, name)'
+  });
+
+  if (!result.data.files.length) return false;
+
+  const fileId = result.data.files[0].id;
+  const dest = fs.createWriteStream(ZIP_PATH);
+  await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' })
+    .then(res => new Promise((resolve, reject) => {
+      res.data
+        .on('end', () => resolve())
+        .on('error', err => reject(err))
+        .pipe(dest);
+    }));
+
+  const unzip = require('unzipper');
+  await fs.createReadStream(ZIP_PATH).pipe(unzip.Extract({ path: SESSION_DIR })).promise();
+  return true;
+}
+
+module.exports = { uploadSessionToDrive, downloadSessionFromDrive };
