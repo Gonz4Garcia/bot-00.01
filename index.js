@@ -1,179 +1,90 @@
 require('dotenv').config();
-const fs = require('fs');
-const path = require('path');
 const express = require('express');
-const axios = require('axios');
-const qrcode = require('qrcode-terminal');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
-const { uploadSessionFile, downloadSessionFile } = require('./driveSession');
+const qrcode = require('qrcode-terminal');
+const fs = require('fs');
+const { uploadSessionToDrive, downloadSessionFromDrive } = require('./driveSession');
+const axios = require('axios');
+const path = require('path');
+
+const SESSION_PATH = './.wwebjs_auth/session.zip';
 
 const app = express();
-const port = process.env.PORT || 3000;
-
 app.use(express.json());
 
 let qrCodeText = '';
 let isClientReady = false;
 
-// Inicializa WhatsApp con sesión restaurada desde Google Drive
-(async () => {
-  const sessionExists = await downloadSessionFile();
-  if (sessionExists) {
-    console.log('🔁 Sesión restaurada desde Google Drive');
-  } else {
-    console.log('🔐 No se encontró sesión previa. Se generará un nuevo QR.');
+const client = new Client({
+  authStrategy: new LocalAuth(),
+  puppeteer: {
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
   }
+});
 
-  const client = new Client({
-    authStrategy: new LocalAuth({
-      dataPath: './auth_data',
-    }),
-    puppeteer: {
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    },
-  });
+// Manejar QR
+client.on('qr', (qr) => {
+  qrCodeText = qr;
+  qrcode.generate(qr, { small: true });
+  console.log('📷 QR recibido, esperando escaneo...');
+});
 
-  // Mostrar QR en consola y endpoint
-  client.on('qr', qr => {
-    qrCodeText = qr;
-    console.log('📲 Escaneá este código QR:\n');
-    qrcode.generate(qr, { small: true });
-    console.log('🌐 QR disponible en: https://bot-00-qt68.onrender.com/qr');
-  });
+// Cliente listo
+client.on('ready', async () => {
+  console.log('✅ WhatsApp conectado');
+  isClientReady = true;
 
-  // Conexión lista
-  client.on('ready', () => {
-    isClientReady = true;
-    console.log('✅ WhatsApp conectado');
-    uploadSessionFile(); // Guardar sesión en Drive al conectarse
-  });
+  // Subir sesión a Drive
+  try {
+    await uploadSessionToDrive();
+    console.log('📦 auth_data comprimido y subido a Drive');
+  } catch (err) {
+    console.error('❌ Error al subir session:', err.message);
+  }
+});
 
-  // Reenviar mensaje entrante a n8n
-  client.on('message', async msg => {
-    const sender = msg.from;
-    const message = msg.body;
-    const n8nWebhookUrl = process.env.N8N_WEBHOOK_URL;
+// Escuchar mensajes
+client.on('message', async (msg) => {
+  console.log(`💬 Mensaje recibido de ${msg.from}: ${msg.body}`);
+});
 
-    const operationId = `msg-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    const timestamp = new Date().toISOString();
-
-    let mediaUrl = null;
-    let messageType = "text";
-
-    if (msg.hasMedia) {
-      const media = await msg.downloadMedia();
-      if (media) {
-        mediaUrl = `data:${media.mimetype};base64,${media.data}`;
-        const mime = media.mimetype;
-
-        if (mime.startsWith("image/")) {
-          messageType = "image";
-        } else if (mime.startsWith("audio/")) {
-          messageType = "audio";
-        } else if (mime.startsWith("video/")) {
-          messageType = "video";
-        } else {
-          messageType = "document";
-        }
-      }
+// Inicializar cliente
+(async () => {
+  try {
+    const downloaded = await downloadSessionFromDrive();
+    if (downloaded) {
+      console.log('📥 Sesión descargada desde Google Drive.');
+    } else {
+      console.log('⚠️ No se encontró sesión en Drive. Se generará nuevo QR.');
     }
-
-    const payload = {
-      id: operationId,
-      timestamp,
-      number: sender,
-      message,
-      mediaUrl,
-      messageType,
-    };
-
-    try {
-      await axios.post(n8nWebhookUrl, payload);
-      console.log(`📨 Mensaje reenviado a n8n. ID: ${operationId}, Fecha: ${timestamp}`);
-    } catch (error) {
-      console.error(`❌ Error al enviar mensaje a n8n (ID: ${operationId}):`, error.response?.data || error.message);
-    }
-  });
-
-  // Endpoint para mostrar QR
-  app.get('/qr', (req, res) => {
-    if (!qrCodeText) {
-      return res.send('❌ QR no disponible aún. Esperá que cargue.');
-    }
-
-    const qrPage = `
-      <html>
-        <head><title>QR de WhatsApp</title></head>
-        <body style="text-align:center;font-family:sans-serif">
-          <h2>Escaneá este código QR</h2>
-          <img src="https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(
-            qrCodeText
-          )}&size=300x300" />
-          <p>🔁 Refrescá la página si tarda mucho.</p>
-        </body>
-      </html>
-    `;
-    res.send(qrPage);
-  });
-
-  // Endpoint de prueba
-  app.get('/', (req, res) => {
-    res.send('API OK');
-  });
-
-  // Envío de mensajes vía POST
-  app.post('/reply', async (req, res) => {
-    if (!isClientReady) {
-      return res.status(400).json({ error: 'WhatsApp no está listo aún' });
-    }
-
-    const { number, message, mediaUrl } = req.body;
-    const chatId = number.includes('@') ? number : `${number}@c.us`;
-
-    try {
-      const chat = await client.getChatById(chatId);
-
-      if (mediaUrl) {
-        const media = await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true });
-        await chat.sendMessage(media, { caption: message || '' });
-      } else {
-        await chat.sendMessage(message);
-      }
-
-      res.json({ status: 'ok' });
-    } catch (err) {
-      console.error('❌ Error al enviar mensaje POST:', err);
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Envío de mensajes vía GET
-  app.get('/reply', async (req, res) => {
-    if (!isClientReady) {
-      return res.status(400).send('WhatsApp no está listo aún');
-    }
-
-    const rawNumber = req.query.number;
-    const message = req.query.message;
-    const chatId = rawNumber.includes('@') ? rawNumber : `${rawNumber}@c.us`;
-
-    try {
-      const chat = await client.getChatById(chatId);
-      await chat.sendMessage(message);
-      res.send('Mensaje enviado 👍');
-    } catch (err) {
-      console.error('❌ Error al enviar mensaje GET:', err);
-      res.status(500).send('Error: ' + err.message);
-    }
-  });
-
-  // Iniciar cliente WhatsApp
-  client.initialize();
-
+    await client.initialize();
+  } catch (err) {
+    console.error('❌ Error durante inicialización:', err.message);
+  }
 })();
 
-// Iniciar servidor Express
-app.listen(port, () => {
-  console.log(`🚀 API escuchando en http://localhost:${port}`);
+// Endpoint para consultar QR
+app.get('/qr', (req, res) => {
+  res.json({
+    qr: qrCodeText || 'No disponible',
+    ready: isClientReady,
+  });
 });
+
+// Endpoint para recibir mensajes desde n8n
+app.post('/webhook', async (req, res) => {
+  try {
+    const { number, message } = req.body;
+    if (!number || !message) {
+      return res.status(400).json({ error: 'Falta number o message en body.' });
+    }
+    await client.sendMessage(number, message);
+    res.json({ status: 'enviado' });
+  } catch (err) {
+    console.error('❌ Error al enviar mensaje desde webhook:', err.message);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 Servidor en http://localhost:${PORT}`));
