@@ -1,74 +1,86 @@
 const fs = require('fs');
-const archiver = require('archiver');
 const { google } = require('googleapis');
 const path = require('path');
 
-const SESSION_DIR = path.join(__dirname, '.wwebjs_auth');
-const ZIP_PATH = path.join(__dirname, 'session.zip');
-const FILE_NAME = 'session.zip';
-const FOLDER_ID = '1ejHiPFpVrxXFNr8RRKEsZaQUWPf7cOl3';
+const CREDENTIALS_PATH = path.join(__dirname, 'credentials.json');
+const TOKEN_PATH = path.join(__dirname, 'token.json');
+const SESSION_PATH = path.join(__dirname, 'auth_data.zip');
+const SESSION_DRIVE_FILE_NAME = 'auth_data.zip';
 
-const auth = new google.auth.GoogleAuth({
-  credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS),
-  scopes: ['https://www.googleapis.com/auth/drive']
-});
-const drive = google.drive({ version: 'v3', auth });
+async function authorize() {
+  const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
+  const { client_secret, client_id, redirect_uris } = credentials.installed;
+  const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
 
-async function zipSession() {
-  return new Promise((resolve, reject) => {
-    const output = fs.createWriteStream(ZIP_PATH);
-    const archive = archiver('zip');
-    output.on('close', () => resolve(ZIP_PATH));
-    archive.on('error', err => reject(err));
-    archive.pipe(output);
-    archive.directory(SESSION_DIR, false);
-    archive.finalize();
-  });
+  const token = JSON.parse(process.env.GOOGLE_TOKEN);
+  oAuth2Client.setCredentials(token);
+
+  return oAuth2Client;
 }
 
-async function uploadSessionToDrive() {
-  await zipSession();
+async function uploadSession() {
+  const auth = await authorize();
+  const drive = google.drive({ version: 'v3', auth });
 
-  const existing = await drive.files.list({
-    q: `'${FOLDER_ID}' in parents and name='${FILE_NAME}'`,
-    fields: 'files(id)',
+  const fileMetadata = {
+    name: SESSION_DRIVE_FILE_NAME,
+  };
+  const media = {
+    mimeType: 'application/zip',
+    body: fs.createReadStream(SESSION_PATH),
+  };
+
+  // Elimina archivo anterior si existe
+  const list = await drive.files.list({
+    q: `name='${SESSION_DRIVE_FILE_NAME}'`,
+    fields: 'files(id, name)',
   });
 
-  if (existing.data.files.length) {
-    await drive.files.update({
-      fileId: existing.data.files[0].id,
-      media: { body: fs.createReadStream(ZIP_PATH) }
-    });
-  } else {
-    await drive.files.create({
-      resource: { name: FILE_NAME, parents: [FOLDER_ID] },
-      media: { body: fs.createReadStream(ZIP_PATH) },
-      fields: 'id',
-    });
+  if (list.data.files.length > 0) {
+    await drive.files.delete({ fileId: list.data.files[0].id });
   }
-}
 
-async function downloadSessionFromDrive() {
-  const result = await drive.files.list({
-    q: `'${FOLDER_ID}' in parents and name='${FILE_NAME}'`,
-    fields: 'files(id, name)'
+  await drive.files.create({
+    resource: fileMetadata,
+    media: media,
+    fields: 'id',
   });
 
-  if (!result.data.files.length) return false;
-
-  const fileId = result.data.files[0].id;
-  const dest = fs.createWriteStream(ZIP_PATH);
-  await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' })
-    .then(res => new Promise((resolve, reject) => {
-      res.data
-        .on('end', () => resolve())
-        .on('error', err => reject(err))
-        .pipe(dest);
-    }));
-
-  const unzip = require('unzipper');
-  await fs.createReadStream(ZIP_PATH).pipe(unzip.Extract({ path: SESSION_DIR })).promise();
-  return true;
+  console.log('✅ auth_data.zip subido a Google Drive.');
 }
 
-module.exports = { uploadSessionToDrive, downloadSessionFromDrive };
+async function downloadSession() {
+  const auth = await authorize();
+  const drive = google.drive({ version: 'v3', auth });
+
+  const list = await drive.files.list({
+    q: `name='${SESSION_DRIVE_FILE_NAME}'`,
+    fields: 'files(id, name)',
+  });
+
+  if (list.data.files.length === 0) {
+    return false;
+  }
+
+  const fileId = list.data.files[0].id;
+  const dest = fs.createWriteStream(SESSION_PATH);
+
+  await drive.files.get(
+    { fileId, alt: 'media' },
+    { responseType: 'stream' },
+    (err, res) => {
+      if (err) return console.error('❌ Error al descargar sesión:', err);
+      res.data.pipe(dest);
+    }
+  );
+
+  return new Promise((resolve) => {
+    dest.on('finish', () => resolve(true));
+    dest.on('error', () => resolve(false));
+  });
+}
+
+module.exports = {
+  uploadSession,
+  downloadSession,
+};
